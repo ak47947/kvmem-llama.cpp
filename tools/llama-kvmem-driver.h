@@ -157,7 +157,9 @@ struct LlamaEngineState {
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
     ggml_type cache_type_v = GGML_TYPE_Q8_0;
     ggml_type spec_cache_type = GGML_TYPE_F16;
-    bool spec_mtp = false;
+    bool spec_enabled = false;
+    kvmem::SpeculativeAlgorithm spec_algorithm = kvmem::SpeculativeAlgorithm::None;
+    std::string spec_draft_model;
     int spec_n_max = 3;
     float spec_p_min = 0.0f;
     std::vector<llama_token> cached_tokens;

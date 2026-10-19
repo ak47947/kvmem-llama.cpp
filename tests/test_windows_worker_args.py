@@ -14,6 +14,31 @@ SHELLS = [path for name in ('powershell.exe', 'pwsh.exe') if (path := shutil.whi
 
 @unittest.skipUnless(os.name == 'nt' and SHELLS, 'Windows PowerShell launchers')
 class WorkerArgsTests(unittest.TestCase):
+    def test_canonical_dflash2_maps_to_each_native_backend(self):
+        draft = self.folder / "draft & ' spaces.gguf"; draft.touch()
+        target = self.folder / 'target.gguf'; target.touch()
+        for shell in SHELLS:
+            with self.subTest(shell=shell, backend='ninfer'):
+                plan = self.plan(self.run_launcher(shell, 'start-backend.ps1', [
+                    '-SpeculativeMode', 'dflash2', '-DraftTokens', '5', '-DraftPolicy', 'fixed']))
+                args = plan['argv']; self.assertEqual(args[args.index('--spec') + 1], 'dflash2')
+                self.assertEqual(args.count('--spec'), 1); self.assertNotIn('--adaptive-mtp', args)
+            def llama(extra):
+                return subprocess.run([shell, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+                    str(ROOT / 'scripts/windows/start-backend.ps1'), '-Backend', 'llamacpp', '-Worker', sys.executable,
+                    '-Model', str(target), '-Gpu', 'GPU-test', '-SpeculativeMode', 'dflash2', '-DraftTokens', '5',
+                    '-DryRun', *extra], capture_output=True, encoding='utf-8', errors='replace', timeout=45)
+            with self.subTest(shell=shell, backend='llamacpp'):
+                args = self.plan(llama(['-DraftModel', str(draft)]))['argv']
+                self.assertEqual(args[args.index('--spec-type') + 1], 'draft-dflash')
+                self.assertEqual(args[args.index('--spec-draft-model') + 1], str(draft))
+                self.assertEqual(args[args.index('--spec-draft-n-max') + 1], '5')
+                paired = self.plan(llama(['-DraftModel', str(draft), '-Concurrency', '4']))['argv']
+                self.assertEqual(paired[paired.index('--parallel') + 1], '4')
+                for invalid in ([], ['-DraftModel', str(draft), '-DraftPolicy', 'adaptive'],
+                                ['-DraftModel', str(draft), '-Concurrency', '5']):
+                    self.assertNotEqual(llama(invalid).returncode, 0)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='kvmem-argv-')
         self.folder = Path(self.tmp.name)

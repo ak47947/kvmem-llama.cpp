@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+SPECULATIVE_PROFILES = json.loads((ROOT / 'scripts/speculative-capabilities.json').read_text(encoding='utf-8-sig'))
 DEFAULTS = dict(Backend='ninfer', Model='', Worker='', Gpu='', Context=262144,
                 Budget=32768, Reserve=1024, HostMiB=16384, Prefill=128,
                 MaxTokens=1024, Port=18200, ListenHost='127.0.0.1',
@@ -33,10 +34,10 @@ DEFAULTS = dict(Backend='ninfer', Model='', Worker='', Gpu='', Context=262144,
 STRINGS = {'Backend', 'Model', 'Worker', 'Gpu', 'ListenHost', 'KvType', 'KvTypeK', 'KvTypeV', 'DiskPath',
            'VisionResidency',
            'DeviceProfile', 'ScoreAggregation', 'ApiKey', 'ModelAlias', 'LogLevel',
-           'ChatTemplateFile', 'ThinkingMode', 'ReasoningEffort'}
+           'ChatTemplateFile', 'ThinkingMode', 'ReasoningEffort', 'SpeculativeMode', 'DraftPolicy', 'DraftModel'}
 INTEGERS = {'Context', 'Budget', 'Reserve', 'HostMiB', 'Prefill', 'MaxTokens', 'Port',
             'MtpDrafts', 'NgramDrafts', 'NgramMinMatch', 'Concurrency', 'RetainedSessions',
-            'VisionTokens', 'ThinkingBudget', 'SinkTokens', 'RecentTokens', 'DiskMiB'}
+            'VisionTokens', 'ThinkingBudget', 'SinkTokens', 'RecentTokens', 'DiskMiB', 'DraftTokens'}
 BOOLEANS = {'AdaptiveMtp', 'FastPrefill', 'Vision', 'NoLrfu', 'PreserveThinking'}
 DECIMALS = {'LrfuLambda', 'LrfuTopFraction'}
 # Deliberately limited native escape hatch. Common options must not be duplicated.
@@ -96,6 +97,40 @@ def normalize(data, backends):
         raise ValueError('Concurrency must be 1..8 for NInfer or 1..4 for llama.cpp')
     if p.get('ChatTemplateFile') and not Path(p['ChatTemplateFile']).is_file():
         raise ValueError('ChatTemplateFile must be an existing template file')
+    if 'SpeculativeMode' in p or 'DraftTokens' in p or 'DraftPolicy' in p or 'DraftModel' in p:
+        mode = p.get('SpeculativeMode', 'mtp' if p.get('MtpDrafts', 0) else 'none')
+        profile = SPECULATIVE_PROFILES[p['Backend']].get(mode)
+        if profile is None:
+            raise ValueError('Unsupported SpeculativeMode')
+        count = p.get('DraftTokens', p.get('MtpDrafts', 5 if mode == 'dflash2' else 4 if mode == 'mtp' else 0))
+        policy = p.get('DraftPolicy', 'adaptive' if p.get('AdaptiveMtp') else 'fixed')
+        if policy not in {'fixed', 'adaptive'}:
+            raise ValueError('DraftPolicy must be fixed or adaptive')
+        if 'DraftTokens' in p and 'MtpDrafts' in p and count != p['MtpDrafts']:
+            raise ValueError('DraftTokens conflicts with MtpDrafts')
+        if 'DraftPolicy' in p and 'AdaptiveMtp' in p and (policy == 'adaptive') != p['AdaptiveMtp']:
+            raise ValueError('DraftPolicy conflicts with AdaptiveMtp')
+        if mode == 'none':
+            if count or policy == 'adaptive' or p.get('NgramDrafts') or p.get('DraftModel'):
+                raise ValueError('Disabled speculative decoding cannot have active draft options')
+        else:
+            if not 1 <= count <= profile['max_draft_tokens']:
+                raise ValueError('DraftTokens exceeds this backend/algorithm capability')
+            if policy == 'adaptive' and not profile['adaptive']:
+                raise ValueError('Adaptive drafts are unavailable for this backend/algorithm')
+            if p.get('NgramDrafts') and not profile['ngram']:
+                raise ValueError('Ngram drafts are unavailable for this backend/algorithm')
+            if p.get('Concurrency', 1) > profile['max_concurrency']:
+                raise ValueError('This speculative algorithm does not support the selected concurrency')
+            if len(p.get('Gpu', '').split(',')) > profile['max_devices']:
+                raise ValueError('This speculative algorithm does not support the selected GPU count')
+            draft = p.get('DraftModel', '')
+            if profile['draft_asset'] == 'embedded' and draft:
+                raise ValueError('NInfer uses an embedded draft component')
+            if profile['draft_asset'] == 'required_gguf' and not draft:
+                raise ValueError('DFlash2 requires DraftModel with a compatible GGUF')
+            if draft and (Path(draft).suffix.lower() != '.gguf' or not Path(draft).is_file()):
+                raise ValueError('DraftModel must be an existing GGUF file')
     gpu = p.get('Gpu', '')
     if gpu and not all(re.fullmatch(r'GPU-[0-9a-fA-F-]{8,64}', x) for x in gpu.split(',')):
         raise ValueError('Select GPUs by UUID, separated by commas')
@@ -167,6 +202,8 @@ class Controller:
         if not match:
             raise ValueError('Cannot detect supported backends from start-backend.ps1')
         self.backends = [name for name in re.findall(r"'([^']+)'", match[1]) if name in NATIVE]
+        profile_file = self.backend_root / 'scripts/speculative-capabilities.json'
+        self.speculative_profiles = json.loads(profile_file.read_text(encoding='utf-8-sig')) if profile_file.is_file() else {}
         if not self.backends:
             raise ValueError('This console requires a NInfer or llama.cpp launcher')
         self.port, self.token = port, secrets.token_urlsafe(32)
@@ -682,6 +719,7 @@ class Handler(BaseHTTPRequestHandler):
                                 'console_protocol': 1, 'console_root': str(ROOT.resolve()),
                                 'model_library_version': 1,
                                 'kv_cache_version': 1,
+                                'speculative_capabilities': self.control.speculative_profiles,
                                 'state_dir': str(self.control.state_dir),
                                 'backend_root': str(self.control.backend_root), 'gpus': self.server.gpus,
                                 'draft': self.control.draft(), 'status': self.control.status(),

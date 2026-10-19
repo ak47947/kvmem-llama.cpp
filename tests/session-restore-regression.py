@@ -15,7 +15,10 @@ def main():
     parser.add_argument('--exe', type=Path, required=True)
     parser.add_argument('--model', type=Path)
     parser.add_argument('--gpu', default=os.environ.get('KVMEM_TEST_GPU'), help='GPU UUID')
+    parser.add_argument('--gpu-layers', type=int, default=99)
+    parser.add_argument('--expect-mixed-capture', action='store_true')
     parser.add_argument('--mtp', action='store_true')
+    parser.add_argument('--dflash2-draft', type=Path)
     parser.add_argument('--mtp-state', choices=['replay', 'snapshots'], default='snapshots')
     parser.add_argument('--block-tokens', type=int, choices=[32, 64, 128], default=64)
     parser.add_argument('--turns', type=int, default=4)
@@ -32,12 +35,14 @@ def main():
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
     command = [str(args.exe), '-m', str(args.model), '--host', '127.0.0.1', '--port', str(port),
-               '-c', '8192', '-ngl', '99', '-b', '128', '-ub', '128', '--no-ui', '--no-think',
+               '-c', '8192', '-ngl', str(args.gpu_layers), '-b', '128', '-ub', '128', '--no-ui', '--no-think',
                '--kvmem', '--kvmem-budget', '512', '--kvmem-gen-reserve', '128',
                '--kvmem-block-tokens', str(args.block_tokens), '--kvmem-sessions', '4', '--kv-dtype', 'q8_0',
-               '--spec-type', 'draft-mtp' if args.mtp else 'none', '--kvmem-trace']
-    if args.mtp:
-        command += ['--spec-draft-n-max', '3', '--spec-kv-dtype', 'f16', '--kvmem-mtp-state', args.mtp_state]
+               '--spec-type', 'draft-dflash' if args.dflash2_draft else 'draft-mtp' if args.mtp else 'none', '--kvmem-trace']
+    if args.mtp or args.dflash2_draft:
+        command += ['--spec-draft-n-max', '5' if args.dflash2_draft else '3', '--spec-kv-dtype', 'f16', '--kvmem-mtp-state', args.mtp_state]
+    if args.dflash2_draft:
+        command += ['--spec-draft-model', str(args.dflash2_draft)]
     env = {k: v for k, v in os.environ.items() if not k.startswith(('KVMEM_', 'NINFER_', 'GGML_', 'LLAMA_ARG_'))}
     env.pop('CUDA_LAUNCH_BLOCKING', None)
     env.update(CUDA_VISIBLE_DEVICES=args.gpu, CUDA_DEVICE_ORDER='PCI_BUS_ID', GGML_DISABLE_VULKAN='1')
@@ -106,10 +111,12 @@ def main():
                 history.append({'role': 'assistant', 'content': response['choices'][0]['message']['content'] or 'Recorded.'})
                 chat(f'next-short-{turn}', short, 16)
             trace = log_path.read_text(encoding='utf-8', errors='replace')
+            if args.expect_mixed_capture:
+                assert 'harvest_sync reason=non_uniform_capture' in trace, 'mixed capture path was not exercised'
             restored = re.findall(r'checkpoint_tail_restore row=(\d+) block=(\d+)', trace)
             assert restored and any(int(row) % args.block_tokens for row, _ in restored), 'cold partial block was not restored'
             assert not re.search(r'position/coverage gap|checkpoint_restore_fallback|multimodal_error|CUDA error:', trace)
-            if args.mtp:
+            if args.mtp or args.dflash2_draft:
                 assert sum(map(int, re.findall(r'spec_stats[^\r\n]* n_drafted=(\d+)', trace))) > 0
 
             def log_suffix(offset):
@@ -157,9 +164,17 @@ def main():
             assert not re.search(r'position/coverage gap|CUDA error:|checkpoint_restore_fallback|KVMEM cache clear failed', trace)
             assert 'multimodal_rollback_failed' not in trace
             restored = re.findall(r'checkpoint_tail_restore row=(\d+) block=(\d+)', trace)
+            if args.dflash2_draft:
+                spec = call('/props')['speculative']
+                assert spec['schema_version'] == 1 and spec['algorithm'] == 'dflash2', spec
+                stats = spec['statistics']
+                assert stats['requests'] >= len(rows) and stats['rounds'] > 0, stats
+                assert 0 <= stats['accepted_tokens'] <= stats['drafted_tokens'] and stats['drafted_tokens'] > 0, stats
+                (args.out / 'speculative.json').write_text(json.dumps(spec, indent=2))
             (args.out / 'summary.json').write_text(json.dumps({'pass': True, 'requests': len(rows),
                 'checkpoint_tail_restores': restored, 'cancel_recovery': True,
-                'gpu_uuid': args.gpu, 'mtp': args.mtp, 'mtp_state':args.mtp_state if args.mtp else None,
+                'gpu_uuid': args.gpu, 'mtp': args.mtp, 'dflash2': bool(args.dflash2_draft),
+                'mtp_state':args.mtp_state if args.mtp or args.dflash2_draft else None,
                 'block_tokens':args.block_tokens, 'turns':args.turns,
                 'cancel_checks':cancel_checks,
                 'recovery_policy':'preserve_only'}, indent=2))

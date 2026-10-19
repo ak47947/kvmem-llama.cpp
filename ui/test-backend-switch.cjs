@@ -76,7 +76,7 @@ module.exports=async({browser,base,info})=>{
   assert.equal(await field('Worker').inputValue(),'C:/workers/llama.exe');assert.equal(await field('KvTypeK').inputValue(),'q8_0');assert.equal(await field('KvTypeV').inputValue(),'q4_0');
   assert.deepEqual(await order(),[gpus[0].uuid]);assert.equal(await page.locator('[data-gpu-limit]').isVisible(),false);
   assert.equal(await page.locator('[data-gpu-order]').isVisible(),false,'single-GPU mode has no unnecessary order controls');
-  for(const key of ['StageLayers','MtpDrafts','Vision','ThinkingBudget'])assert.equal(await field(key).isDisabled(),true,key);
+  for(const key of ['StageLayers','DraftTokens','Vision','ThinkingBudget'])assert.equal(await field(key).isDisabled(),true,key);
   await page.locator('[data-language-select]').selectOption('en');assert.deepEqual(await order(),[gpus[0].uuid]);
   await page.locator('[data-language-select]').selectOption('zh-CN');
   await group(4);await field('Concurrency').fill('8');
@@ -89,7 +89,7 @@ module.exports=async({browser,base,info})=>{
   await page.waitForFunction(()=>document.querySelector('[data-check-summary]')?.textContent.includes('检查通过'));
   assert.equal(previews.length,1);assert.equal(previews[0].Gpu,gpus[0].uuid);
   assert.equal(previews[0].KvTypeK,'q8_0');assert.equal(previews[0].KvTypeV,'q4_0');assert.equal(Object.hasOwn(previews[0],'KvType'),false);
-  for(const key of ['StageLayers','MtpDrafts','Vision','ThinkingBudget'])assert.equal(Object.hasOwn(previews[0],key),false,key+' must not reach llama');
+  for(const key of ['StageLayers','DraftTokens','Vision','ThinkingBudget'])assert.equal(Object.hasOwn(previews[0],key),false,key+' must not reach llama');
   await closeCheck();
   if(process.env.SCREENSHOT_DIR)await page.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'backend-switch-llama.png'),fullPage:true});
   await field('Backend').selectOption('ninfer');

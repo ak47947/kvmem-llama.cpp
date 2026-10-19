@@ -1,5 +1,6 @@
 #include "llama-kvmem-diag.h"
 #include "kvmem-spec.h"
+#include "../backends/llamacpp/src/llama-ext.h"
 #include "llama-kvmem-hooks.h"
 
 #include <algorithm>
@@ -66,7 +67,8 @@ bool kvmem_cache_types_ok(ggml_type type_k, ggml_type type_v) {
 bool kvmem_spec_start(kvmem_spec_session & sess,
                       llama_model * model_tgt,
                       llama_context * ctx_tgt,
-                      const kvmem_spec_opts & opts) {
+                      const kvmem_spec_opts & opts,
+                      const std::shared_ptr<llama_model> & model_dft) {
     sess = kvmem_spec_session{};
     if (!model_tgt || !ctx_tgt) {
         fprintf(stderr, "kvmem_spec_start: missing target model/context\n");
@@ -76,7 +78,16 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
     common_init();
 
     common_params p;
-    p.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    const bool dflash2 = opts.algorithm == kvmem::SpeculativeAlgorithm::DFlash2;
+    if (dflash2 && (opts.n_max < 1 || opts.n_max > 15)) {
+        fprintf(stderr, "DFlash2 draft count must be in 1..15\n");
+        return false;
+    }
+    if (dflash2 && opts.draft_model.empty()) {
+        fprintf(stderr, "DFlash2 requires --spec-draft-model with a compatible draft GGUF\n");
+        return false;
+    }
+    p.speculative.types = { dflash2 ? COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH : COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
     p.speculative.draft.n_max = opts.n_max;
     p.speculative.draft.n_min = opts.n_min;
     p.speculative.draft.p_min = opts.p_min;
@@ -101,13 +112,30 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
     p.speculative.draft.cache_type_v = opts.draft_type == GGML_TYPE_COUNT ? opts.type_v : opts.draft_type;
 
     common_params p_dft = common_base_params_to_speculative(p);
-    sess.init = common_speculative_init_from_params(p_dft, model_tgt, ctx_tgt);
+    sess.init = common_speculative_init_from_params(p_dft, model_tgt, ctx_tgt, model_dft);
     sess.ctx_dft = sess.init ? sess.init->context() : nullptr;
     if (!sess.ctx_dft) {
         fprintf(stderr,
-                "kvmem_spec_start: MTP draft context is null "
-                "(GGUF missing nextn / qwen35.nextn_predict_layers?)\n");
+                "kvmem_spec_start: draft context is null "
+                "(check draft GGUF, target compatibility or embedded MTP head)\n");
         return false;
+    }
+    if (dflash2 && llama_model_dflash_selector_top_k(llama_get_model(sess.ctx_dft)) <= 0) {
+        fprintf(stderr, "DFlash2 requires a draft GGUF with conv/selector metadata\n");
+        sess.init.reset(); sess.ctx_dft = nullptr;
+        return false;
+    }
+    if (dflash2) {
+        const auto * draft = llama_get_model(sess.ctx_dft);
+        const int32_t * layers = llama_model_target_layer_ids(draft);
+        const uint32_t count = llama_model_target_layer_ids_n(draft);
+        bool compatible = count > 0 && llama_model_n_embd(draft) == llama_model_n_embd(model_tgt);
+        for (uint32_t i = 0; i < count; ++i) compatible &= layers[i] >= 0 && layers[i] < llama_model_n_layer(model_tgt);
+        if (!compatible) {
+            fprintf(stderr, "DFlash2 draft feature width/layers do not match the target model\n");
+            sess.init.reset(); sess.ctx_dft = nullptr;
+            return false;
+        }
     }
 
     kvmem_diag("KVMEM_CONTEXT draft threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
@@ -121,6 +149,8 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
         fprintf(stderr, "kvmem_spec_start: common_speculative_init failed\n");
         return false;
     }
+    sess.config.algorithm = opts.algorithm;
+    sess.config.draft_tokens = (uint32_t) common_speculative_n_max(sess.spec);
 
     // Prefer llama.cpp n_rs_seq GPU planes (qw3-style per-token GDN rollback).
     // Host PARTIAL_ONLY is only the fallback when planes are missing or the
@@ -152,8 +182,12 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
     }
 
     sess.ok = true;
-    kvmem_diag("KVMEM_TRACE spec_start type=draft-mtp n_max=%d p_min=%.3f dft=%p\n",
-            opts.n_max, opts.p_min, (void *) sess.ctx_dft);
+    if (dflash2) {
+        kvmem_diag("KVMEM_DRAFT weights=%p context=%p reused=%d\n",
+                (const void *) llama_get_model(sess.ctx_dft), (void *) sess.ctx_dft, model_dft ? 1 : 0);
+    }
+    kvmem_diag("KVMEM_TRACE spec_start type=%s n_max=%u p_min=%.3f dft=%p\n",
+            kvmem::speculative_name(sess.config.algorithm), sess.config.draft_tokens, opts.p_min, (void *) sess.ctx_dft);
     return true;
 }
 
@@ -269,6 +303,17 @@ kvmem_spec_gen_stats kvmem_spec_generate(
         const std::function<bool()> & abort,
         llama_pos position_offset) {
     kvmem_spec_gen_stats st;
+    st.algorithm = sess.config.algorithm;
+    struct report {
+        kvmem_spec_session & session; kvmem_spec_gen_stats & stats;
+        ~report() {
+            kvmem::SpeculativeStatistics value;
+            value.requests = 1; value.rounds = stats.verification_steps;
+            value.drafted_tokens = stats.draft_tokens; value.accepted_tokens = stats.accepted_tokens;
+            value.generated_tokens = stats.n_gen; value.fallback_steps = stats.fallback_rounds;
+            session.telemetry->add(value);
+        }
+    } telemetry{sess, st};
     if (!sess.ok || !sess.spec || prompt.empty() || n_predict <= 0) {
         st.failed = true;
         return st;
@@ -317,7 +362,11 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             break;
         }
         if (draft.empty()) {
-            common_speculative_get_state(spec, seq_id, driver_ckpt);
+            // Native DFlash KV checkpoints are needed for historical restores,
+            // not for every ordinary ReplaySSM round.
+            if (!sess.independent_draft() || sess.use_ckpt_tgt ||
+                    (!sess.use_gdn_replay && sess.config.draft_tokens > sess.n_rs_tgt && sess.n_rs_tgt > 0))
+                common_speculative_get_state(spec, seq_id, driver_ckpt);
             llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
             ckpt.update_pos(
                     (int64_t) prompt_tgt.size(),

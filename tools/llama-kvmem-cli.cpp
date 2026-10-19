@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "../backends/llamacpp/src/llama-ext.h"
 #include "llama-kvmem-hooks.h"
 #include "kvmem/retrieval_options.hpp"
 #include "kvmem-spec.h"
@@ -59,12 +60,12 @@ static void print_usage(const char * argv0) {
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
             "  --seed N                   RNG seed; -1=random (ordinary default 0, MTP random)\n"
-            "  --spec-type TYPE           none | draft-mtp (default none)\n"
-            "  --spec-kv-dtype TYPE       MTP K/V type (default: inherit target K/V types)\n"
-            "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
+            "  --spec-type TYPE           none | draft-mtp | draft-dflash (default none)\n"
+            "  --spec-kv-dtype TYPE       draft K/V type (default: inherit target K/V types)\n"
+            "  --spec-draft-n-max N       draft tokens (default 2)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
             "  --kvmem-mtp-state MODE     snapshots | replay (default snapshots)\n"
-            "  --spec-draft-model PATH    optional sidecar MTP GGUF\n",
+            "  --spec-draft-model PATH    DFlash2 draft GGUF; optional sidecar MTP GGUF\n",
             argv0);
 }
 
@@ -104,9 +105,10 @@ int main(int argc, char ** argv) {
     ggml_type cache_type_k = GGML_TYPE_Q8_0;
     ggml_type cache_type_v = GGML_TYPE_Q8_0;
     ggml_type spec_cache_type = GGML_TYPE_COUNT;
-    bool spec_mtp = false;
     uint32_t seed = 0;
     bool seed_set = false;
+    bool spec_enabled = false;
+    auto spec_algorithm = kvmem::SpeculativeAlgorithm::None;
     int spec_n_max = 2;
     float spec_p_min = 0.0f;
     std::string spec_draft_model;
@@ -246,14 +248,17 @@ int main(int argc, char ** argv) {
             seed_set = true;
         } else if (eq(arg, "--spec-type")) {
             const char * t = need(arg);
-            if (eq(t, "draft-mtp")) {
-                spec_mtp = true;
+            if (eq(t, "draft-mtp") || eq(t, "mtp")) {
+                spec_algorithm = kvmem::SpeculativeAlgorithm::Mtp;
+            } else if (eq(t, "draft-dflash") || eq(t, "dflash2")) {
+                spec_algorithm = kvmem::SpeculativeAlgorithm::DFlash2;
             } else if (eq(t, "none")) {
-                spec_mtp = false;
+                spec_algorithm = kvmem::SpeculativeAlgorithm::None;
             } else {
-                fprintf(stderr, "unsupported --spec-type %s (P7-0: draft-mtp|none)\n", t);
+                fprintf(stderr, "unsupported --spec-type %s (none|draft-mtp|draft-dflash)\n", t);
                 return 1;
             }
+            spec_enabled = spec_algorithm != kvmem::SpeculativeAlgorithm::None;
         } else if (eq(arg, "--spec-draft-n-max")) {
             spec_n_max = std::atoi(need(arg));
         } else if (eq(arg, "--spec-draft-p-min")) {
@@ -320,29 +325,39 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
-    model_params.load_mtp = spec_mtp;
+    model_params.load_mtp = spec_algorithm == kvmem::SpeculativeAlgorithm::Mtp;
     try {
         device_config.apply(device_options, model_params);
     } catch (const std::exception & e) {
         fprintf(stderr, "invalid GPU configuration: %s\n", e.what());
         return 1;
     }
-    if (model_params.split_mode == LLAMA_SPLIT_MODE_TENSOR && spec_mtp && kparams.enabled && kparams.mtp_state != 0) {
+    if (spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 &&
+            (spec_draft_model.empty() || device_config.devices.size() > 2 || model_params.split_mode == LLAMA_SPLIT_MODE_TENSOR)) {
+        fprintf(stderr, "DFlash2 requires --spec-draft-model and one GPU\n");
+        return 1;
+    }
+    if (model_params.split_mode == LLAMA_SPLIT_MODE_TENSOR && spec_enabled && kparams.enabled && kparams.mtp_state != 0) {
         fprintf(stderr, "tensor KVMem currently supports MTP snapshots only; use --kvmem-mtp-state snapshots\n");
         return 1;
     }
-    if (device_config.devices.size() > 2 && spec_mtp && !kparams.enabled &&
+    if (device_config.devices.size() > 2 && spec_enabled && !kparams.enabled &&
         model_params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
         fprintf(stderr, "multi-GPU MTP requires --kvmem\n");
         return 1;
     }
-    if (device_config.devices.size() > 2 && spec_mtp && !spec_draft_model.empty()) {
+    if (device_config.devices.size() > 2 && spec_enabled && !spec_draft_model.empty()) {
         fprintf(stderr, "multi-GPU MTP currently requires an embedded nextn draft layer\n");
         return 1;
     }
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!model) {
         fprintf(stderr, "failed to load model: %s\n", model_path.c_str());
+        return 1;
+    }
+    if (spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 && llama_model_n_devices(model) > 1) {
+        fprintf(stderr, "DFlash2 requires a single target GPU; select one device\n");
+        llama_model_free(model);
         return 1;
     }
 
@@ -385,7 +400,7 @@ int main(int argc, char ** argv) {
     }
 
     if (kparams.enabled) {
-        if (!spec_mtp) kparams.mtp_state = 0;
+        if (!spec_enabled) kparams.mtp_state = 0;
         if (!nvme_dir.empty()) {
             kparams.nvme_dir = nvme_dir.c_str();
         }
@@ -433,7 +448,7 @@ int main(int argc, char ** argv) {
     ctx_params.no_perf = false;
     ctx_params.type_k = cache_type_k;
     ctx_params.type_v = cache_type_v;
-    if (spec_mtp) {
+    if (spec_enabled) {
         const uint32_t n_out = (uint32_t) (1 + std::max(0, spec_n_max));
         ctx_params.n_outputs_max = n_out;
         ctx_params.n_outputs_max_per_seq = n_out;
@@ -449,7 +464,7 @@ int main(int argc, char ** argv) {
     }
 
     kvmem_spec_session spec_sess;
-    if (spec_mtp) {
+    if (spec_enabled) {
         kvmem_spec_opts sopts;
         sopts.n_max = spec_n_max;
         sopts.p_min = spec_p_min;
@@ -459,6 +474,7 @@ int main(int argc, char ** argv) {
         sopts.n_ubatch = n_ubatch;
         sopts.kvmem_enabled = kparams.enabled;
         sopts.draft_model = spec_draft_model;
+        sopts.algorithm = spec_algorithm;
         sopts.type_k = cache_type_k;
         sopts.type_v = cache_type_v;
         sopts.draft_type = spec_cache_type;

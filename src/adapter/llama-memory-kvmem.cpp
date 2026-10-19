@@ -21,6 +21,7 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-model.h"
 
 #include "llama.h"
@@ -856,6 +857,8 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
     if (!kvmem_current_execution().params.enabled) {
         return nullptr;
     }
+    // DFlash companions retain their independent native cache.
+    if (model.arch == LLM_ARCH_DFLASH) return nullptr;
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         // The execution domain owns one target and its MTP follower. Follow
         // that target's slot layout without setting native ctx_other: v0.7
@@ -2138,8 +2141,18 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
 
     // The single scratch allocation and batched D2D kernel can only touch
     // tensors on its own GPU. Use the backend's per-tensor host path for a
-    // layer split until device-local layout scratch is introduced.
+    // layer split or CPU offload until device-local layout scratch is introduced.
     bool d2d_ok = n_res > 0 && !multi_gpu_;
+    for (uint32_t il = 0; d2d_ok && il < n_layer_; ++il) {
+        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) continue;
+        auto * kt = kv_->get_k_storage(static_cast<int32_t>(il));
+        auto * vt = kv_->get_v_storage(static_cast<int32_t>(il));
+        d2d_ok = (!kt || kvmem_cuda_tensor_ptr(kt)) &&
+                 (v_trans_ || !vt || kvmem_cuda_tensor_ptr(vt));
+        if (!d2d_ok && trace_) {
+            kvmem_diag("KVMEM_TRACE layout_host reason=non_cuda_storage layer=%u\n", il);
+        }
+    }
     uint8_t * scratch = native_layout_scratch_;
     if (d2d_ok) {
         const cudaError_t alloc_error = scratch ? cudaSuccess : cudaMalloc(reinterpret_cast<void **>(&scratch),
@@ -3414,26 +3427,42 @@ void llama_memory_kvmem::harvest_pending_impl(ggml_backend_sched_t sched) {
         return;
     }
     ggml_backend_t be = nullptr;
-    if (sched) {
-        for (const CaptureNode & n : pending_capture_) {
-            if (n.t) {
-                be = ggml_backend_sched_get_tensor_backend(sched, n.t);
-                if (be) {
-                    break;
-                }
+    bool uniform_gpu_capture = true;
+    for (const CaptureNode & n : pending_capture_) {
+        if (!n.t) continue;
+        if (!kvmem_cuda_tensor_ptr(n.t)) {
+            uniform_gpu_capture = false;
+            break;
+        }
+        if (sched) {
+            auto * producer = ggml_backend_sched_get_tensor_backend(sched, n.t);
+            auto * device = producer ? ggml_backend_get_device(producer) : nullptr;
+            if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                    (be && be != producer)) {
+                uniform_gpu_capture = false;
+                break;
             }
+            be = producer;
         }
     }
+    if (be && d2h_ && d2h_->compute_done &&
+            d2h_->compute_done->device != ggml_backend_get_device(be)) {
+        uniform_gpu_capture = false;
+    }
     const uint32_t n_pos = pos_queue_.empty() ? 0u : (uint32_t) pos_queue_.front().size();
-    bool submitted = d2h_submit(be);
+    bool submitted = uniform_gpu_capture && d2h_submit(be);
     if (!submitted) {
+        // A CUDA event orders one producer; mixed captures need every backend.
+        if (sched) ggml_backend_sched_synchronize(sched);
+        // Commit older asynchronous captures before touching their host state.
+        harvest_flush();
+        if (trace_ && !uniform_gpu_capture) {
+            kvmem_diag("KVMEM_TRACE harvest_sync reason=non_uniform_capture n_pos=%u\n", n_pos);
+        }
         cur_pos_ = std::move(pos_queue_.front());
         pos_queue_.erase(pos_queue_.begin());
         for (const CaptureNode & n : pending_capture_) {
             harvest_capture(n.t, n.il, n.which);
-        }
-        if (sched) {
-            ggml_backend_sched_synchronize(sched);
         }
     }
     const int64_t entry_us = ggml_time_us() - t_entry;
@@ -5306,6 +5335,15 @@ llama_pos llama_kvmem_model_pos(uint32_t logical) {
 }
 
 bool llama_kvmem_remove_logical(llama_context * ctx, llama_pos begin, llama_pos end) {
+    if (llama_get_model(ctx)->arch == LLM_ARCH_DFLASH) {
+        auto * native = llama_get_memory(ctx);
+        if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(native)) {
+            return iswa->get_base()->seq_rm_logical(0, begin, end) &&
+                   iswa->get_swa()->seq_rm_logical(0, begin, end);
+        }
+        if (auto * kv = dynamic_cast<llama_kv_cache *>(native)) return kv->seq_rm_logical(0, begin, end);
+        return false;
+    }
     auto * mem = kvmem_capture_active();
     if (mem) return mem->remove_logical(ctx, begin, end);
     auto * native = llama_get_memory(ctx);

@@ -17,6 +17,24 @@ spec.loader.exec_module(console)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_speculative_config_validates_backend_algorithm_combinations(self):
+        def normalize(**overrides):
+            return console.normalize({'schema_version': 1, 'parameters': {
+                **console.DEFAULTS, 'SpeculativeMode': 'dflash2', 'DraftTokens': 5, **overrides}}, ['ninfer', 'llamacpp'])
+        self.assertEqual(normalize()['parameters']['SpeculativeMode'], 'dflash2')
+        self.assertEqual(normalize(Concurrency=4)['parameters']['Concurrency'], 4)
+        for invalid in ({'DraftPolicy': 'adaptive'}, {'Concurrency': 5}, {'DraftTokens': 16},
+                        {'DraftTokens': 0}, {'DraftModel': 'external.gguf'},
+                        {'SpeculativeMode': 'none'}, {'MtpDrafts': 3}, {'DraftPolicy': 'unknown'}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError): normalize(**invalid)
+        draft = Path(self.tmp.name) / 'draft with spaces.gguf'; draft.touch()
+        value = normalize(Backend='llamacpp', DraftModel=str(draft))
+        self.assertEqual(value['parameters']['DraftModel'], str(draft))
+        self.assertEqual(normalize(Backend='llamacpp', DraftModel=str(draft), Concurrency=4)['parameters']['Concurrency'], 4)
+        for invalid in ({'DraftModel': ''}, {'DraftTokens': 6}, {'NgramDrafts': 8}, {'Concurrency': 5}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                normalize(Backend='llamacpp', **{'DraftModel': str(draft), **invalid})
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.controller = console.Controller(console.ROOT, self.tmp.name, 18199)

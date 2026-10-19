@@ -242,12 +242,21 @@
     for(const key of ['VisionTokens','VisionResidency'])dependency(key,vision,tr('先开启图像输入。','Enable vision input first.'));
     dependency('ThinkingBudget',get('ThinkingMode')?.value!=='off',tr('默认思考模式已关闭；重新开启或选择默认后可设置预算。','Default thinking is off. Select on or default to set a budget.'));
     dependency('ReasoningEffort',get('ThinkingMode')?.value!=='off',tr('默认思考模式已关闭；选择默认后可设置思考强度。','Default thinking is off. Select default to set reasoning effort.'));
-    const mtpEnabled=!!get('MtpEnabled')?.checked&&!get('MtpEnabled').disabled;
-    dependency('MtpDrafts',mtpEnabled,tr('先开启 MTP。','Enable MTP first.'));
-    if(get('MtpDrafts'))get('MtpDrafts').required=mtpEnabled;
-    const mtp=mtpEnabled&&Number(get('MtpDrafts')?.value)>0;
-    for(const key of ['AdaptiveMtp','NgramDrafts'])dependency(key,mtp,tr('先开启 MTP，并设置有效的推测长度。','Enable MTP and set a valid draft length first.'));
-    dependency('NgramMinMatch',mtp&&Number(get('NgramDrafts')?.value)>0,tr('先启用 MTP，并将 N-gram 推测 token 数设为大于 0。','Enable MTP and set N-gram draft tokens greater than 0 first.'));
+    const backend=get('Backend').value,mode=get('SpeculativeMode')?.value||'none';
+    const profiles=info.speculative_capabilities?.[backend]||{none:{},...(backend==='ninfer'?{mtp:{max_draft_tokens:15,adaptive:true,ngram:true,max_concurrency:8,max_devices:8}}:{})};
+    const cap=profiles[mode]||{},enabled=mode!=='none';
+    dependency('DraftTokens',enabled,tr('先选择草稿方式。','Select a draft method first.'));
+    if(get('DraftTokens')){get('DraftTokens').required=enabled;get('DraftTokens').max=String(cap.max_draft_tokens||15);}
+    dependency('DraftPolicy',enabled&&!!cap.adaptive,tr('所选后端或草稿方式仅支持固定长度。','The selected backend or draft method supports fixed length only.'));
+    dependency('NgramDrafts',enabled&&!!cap.ngram,tr('所选后端或草稿方式不支持 N-gram。','The selected backend or draft method does not support N-gram.'));
+    dependency('NgramMinMatch',enabled&&!!cap.ngram&&Number(get('NgramDrafts')?.value)>0,tr('先启用 N-gram 草稿。','Enable N-gram drafts first.'));
+    dependency('DraftModel',enabled&&backend==='llamacpp',tr('NInfer 使用模型内置草稿组件；llama.cpp 需先选择草稿方式。','NInfer uses an embedded draft component. Select a draft method for llama.cpp first.'));
+    if(get('DraftModel'))get('DraftModel').required=enabled&&cap.draft_asset==='required_gguf';
+    const selectedGpu=get('Gpu'),selectedCount=selectedGpu?.multiple?selectedGpu.selectedOptions.length:(selectedGpu?.value||'').split(',').filter(Boolean).length;
+    const specReason=enabled&&(!profiles[mode]||Number(get('Concurrency')?.value||1)>(cap.max_concurrency||1)||selectedCount>(cap.max_devices||1))?
+      tr('当前草稿方式不支持所选并发或显卡数量。','The selected draft method does not support this concurrency or GPU count.'):'';
+    get('SpeculativeMode')?.setCustomValidity(specReason);
+    for(const option of get('SpeculativeMode')?.options||[]){const c=profiles[option.value];option.disabled=!c||(option.value!=='none'&&(Number(get('Concurrency')?.value||1)>c.max_concurrency||selectedCount>c.max_devices));}
     dependency('FastPrefill',['int8','rk8v4','rk4v4','rk4v4-e8','rk2v4-e8'].includes(get('KvType')?.value),tr('当前 KV 格式不支持快速预填充。','The current KV format does not support fast prefill.'));
     const gpu=get('Gpu'),gpuCount=gpu?.multiple?gpu.selectedOptions.length:(gpu?.value||'').split(',').filter(Boolean).length;
     dependency('StageLayers',gpuCount>1,tr('至少选择两张显卡后才能设置层数分配。','Select at least two GPUs to assign layers.'));
@@ -503,6 +512,9 @@
     const log=side.querySelector('.l-log');if(log)side.insertBefore(panel,log);else side.append(panel);
   }
   function render(p){
+    // Migrate old templates in memory; only canonical fields are submitted.
+    p={...p,SpeculativeMode:p.SpeculativeMode??(p.MtpEnabled===false?'none':Number(p.MtpDrafts)>0?'mtp':'none'),
+      DraftTokens:p.DraftTokens??p.MtpDrafts??4,DraftPolicy:p.DraftPolicy??(p.AdaptiveMtp?'adaptive':'fixed')};
     let refreshGpuOrder=()=>{};
     const b=p.Backend,n=b==='ninfer',l=b==='llamacpp';
     closeHelp();root.replaceChildren();
@@ -619,11 +631,22 @@
     field(panels[1],p,'Prefill','预填充块大小 · tokens','Prefill chunk · tokens','number');
     const layerSplit=field(panels[1],{...p,StageLayers:(p.StageLayers||[]).join(',')},'StageLayers','多卡层数分配（可选）','Layer split (optional)','text',null,[n?'依次对应上方第 1、2…张显卡，用逗号分隔；留空由后端分配':'当前接入暂不支持设置多卡层数',n?'Comma-separated counts for GPU 1, 2, … above; empty uses backend allocation':'Layer assignment is unavailable in this integration'],!n);
     layerSplit.addEventListener('input',refreshGpuOrder);refreshGpuOrder();
-    const mtpEnabled=field(panels[1],{MtpEnabled:typeof p.MtpEnabled==='boolean'?p.MtpEnabled:Number(p.MtpDrafts)>0},'MtpEnabled','启用 MTP','Enable MTP','checkbox',null,['需要模型支持。关闭后保留推测长度、自适应 MTP 和 N-gram 设置，但不启用它们；重新开启时恢复。','Requires model support. Turning this off retains draft length, adaptive MTP and N-gram settings while keeping them inactive. Turn it on to restore them.'],l);
-    mtpEnabled.dataset.uiOnly='true';
-    const mtpDrafts=field(panels[1],{...p,MtpDrafts:p.MtpDrafts??4},'MtpDrafts','MTP 推测长度 · tokens','MTP draft length · tokens','number',null,['开启 MTP 时生效，范围 1–15。首次开启默认 4；已有填写值会保留。','Applies when MTP is enabled, range 1–15. The initial default is 4; existing values are retained.'],l);mtpDrafts.min='1';mtpDrafts.max='15';
-    mtpEnabled.addEventListener('change',()=>{if(mtpEnabled.checked&&(!mtpDrafts.value.trim()||Number(mtpDrafts.value)<=0))mtpDrafts.value='4';});
-    field(panels[1],p,'AdaptiveMtp','启用自适应 MTP','Enable adaptive MTP','checkbox',null,['需要先启用 MTP；关闭自适应后仍可使用固定长度 MTP。','Requires MTP. Turning adaptive mode off still allows fixed-length MTP.'],!n);field(panels[1],p,'FastPrefill','启用快速预填充','Enable fast prefill','checkbox',null,['支持 int8、rk8v4、rk4v4、rk4v4-e8、rk2v4-e8；还需模型支持。与 MTP、普通预填充块大小分别设置。','Supports int8, rk8v4, rk4v4, rk4v4-e8 and rk2v4-e8; model support is also required. Independent of MTP and the standard prefill chunk size.'],!n);
+    const specModes=info.speculative_capabilities?.[b]||{none:{},...(n?{mtp:{max_draft_tokens:15,adaptive:true,ngram:true,max_concurrency:8,max_devices:8,draft_asset:'embedded'}}:{})};
+    const specMode=field(panels[1],p,'SpeculativeMode','草稿方式','Draft method','text',[
+      ['none',tr('关闭','Off')],['mtp','MTP'],['dflash2','DFlash2']
+    ],['需要模型支持。可用选项取决于后端、并发和显卡数量。','Requires model support. Availability depends on backend, concurrency and GPU count.']);
+    for(const option of specMode.options)option.disabled=!specModes[option.value];
+    const draftTokens=field(panels[1],p,'DraftTokens','草稿长度 · tokens','Draft length · tokens','number',null,
+      ['主模型会验证草稿；实际长度还受草稿模型限制。DFlash2 首次选择使用 5。','The target verifies the drafts. The draft model can impose a smaller limit. DFlash2 starts at 5.']);
+    draftTokens.min='1';
+    specMode.addEventListener('change',()=>{if(specMode.value==='dflash2')draftTokens.value='5';else if(specMode.value!=='none'&&Number(draftTokens.value)<=0)draftTokens.value='4';});
+    field(panels[1],p,'DraftPolicy','草稿长度策略','Draft length policy','text',[
+      ['fixed',tr('固定','Fixed')],['adaptive',tr('自动调整','Adaptive')]
+    ],['自动调整仅在后端和所选草稿方式支持时生效。','Adaptive mode applies only when supported by the backend and draft method.']);
+    const draftModel=field(panels[1],p,'DraftModel','草稿模型 GGUF','Draft model GGUF','text',null,
+      ['llama.cpp 的 DFlash2 需要与主模型匹配的独立草稿文件；NInfer 使用模型内置草稿组件。','DFlash2 on llama.cpp requires a separate draft matching the target. NInfer uses an embedded draft component.'],n);
+    if(!n){const row=inputActions(draftModel),choose=make('button',{type:'button',class:'s-button l-secondary'},tr('选择文件','Choose file'));row.append(choose);choose.onclick=async()=>{try{const result=await api('browse-model',{backend:'llamacpp',current_path:draftModel.value});if(result.path){draftModel.value=result.path;draftModel.dispatchEvent(new Event('change',{bubbles:true}));}}catch(e){message(e.message,true);}};}
+    field(panels[1],p,'FastPrefill','启用快速预填充','Enable fast prefill','checkbox',null,['支持 int8、rk8v4、rk4v4、rk4v4-e8、rk2v4-e8；还需模型支持。与 MTP、普通预填充块大小分别设置。','Supports int8, rk8v4, rk4v4, rk4v4-e8 and rk2v4-e8; model support is also required. Independent of MTP and the standard prefill chunk size.'],!n);
     field(panels[2],p,'MaxTokens','默认最大输出 · tokens','Default output limit · tokens','number',null,['聊天请求可以覆盖默认输出预算。温度、top-p 等采样参数由聊天请求设置。','Chat requests can override the default output budget. Temperature, top-p and other sampling controls are set by chat requests.']);
     const thinking=field(panels[2],{ThinkingMode:'default',...p},'ThinkingMode','默认思考模式','Default thinking mode','text',[['default',tr('沿用引擎 / 模型默认','Use engine / model default')],['on',tr('开启','On')],['off',tr('关闭','Off')]],n?['NInfer 启动参数支持默认与关闭；显式开启由聊天请求选择，仍需模型支持。','NInfer supports default/off at startup; explicit thinking-on belongs to chat requests and requires model support.']:['llama.cpp 当前默认关闭；开启仍需模型与模板支持。聊天请求可以覆盖此默认值。','llama.cpp currently defaults to off. Enabling requires model/template support; chat requests can override this default.']);
     if(n){thinking.querySelector('[value=on]').disabled=true;thinking.querySelector('[value=on]').textContent=tr('开启 · 由聊天请求设置','On · Set by chat request');}
@@ -650,8 +673,8 @@
       if(!detected?.available&&!p.Worker)worker.parentElement.append(make('small',{class:'l-unavailable'},tr('未检测到默认程序','No default executable detected')));
     }
     if(n){
-      const ngram=field(ng,p,'NgramDrafts','N-gram 推测 token 数','N-gram draft tokens','number',null,['依赖 MTP；0 或留空关闭 N-gram，1–63 启用。并发时后端可能缩小实际推测宽度。','Requires MTP. 0 or empty disables N-gram; 1–63 enables it. The backend may reduce its width under concurrency.']);ngram.max='63';
-      const minMatch=field(ng,p,'NgramMinMatch','N-gram 最短匹配','N-gram minimum match','number',null,['同时启用 MTP 和 N-gram 时生效，范围 4–64。','Applies when both MTP and N-gram are enabled; range 4–64.']);minMatch.min='4';minMatch.max='64';
+      const ngram=field(ng,p,'NgramDrafts','N-gram 推测 token 数','N-gram draft tokens','number',null,['依赖支持 N-gram 的草稿方式；0 或留空关闭，1–63 启用。并发时后端可能缩小实际推测宽度。','Requires a draft method supporting N-gram. 0 or empty disables it; 1–63 enables it. The backend may reduce its width under concurrency.']);ngram.max='63';
+      const minMatch=field(ng,p,'NgramMinMatch','N-gram 最短匹配','N-gram minimum match','number',null,['启用 N-gram 时生效，范围 4–64。','Applies when N-gram is enabled; range 4–64.']);minMatch.min='4';minMatch.max='64';
       field(ng,p,'DeviceProfile','设备性能配置','Device profile','text',[['off',tr('关闭','Off')],['auto',tr('自动','Auto')]]);
 
     }

@@ -165,10 +165,11 @@ static void print_usage(const char * argv0) {
             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
             "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
-            "  --spec-type TYPE           none | draft-mtp (default none)\n"
-            "  --spec-kv-dtype TYPE       MTP K/V type (default f16)\n"
-            "  --spec-draft-n-max N       MTP draft tokens (default 3)\n"
+            "  --spec-type TYPE           none | draft-mtp | draft-dflash (default none)\n"
+            "  --spec-kv-dtype TYPE       draft K/V type (default f16)\n"
+            "  --spec-draft-n-max N       draft tokens (default 3)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
+            "  --spec-draft-model PATH    DFlash2 draft GGUF; optional sidecar for MTP\n"
             "  --jinja                    native Jinja rendering (always enabled)\n"
             "  --chat-template TEMPLATE   override model chat template (Jinja text)\n"
             "  --chat-template-file PATH  load a Jinja template file\n"
@@ -1027,14 +1028,19 @@ int main(int argc, char ** argv) {
             }
         } else if (eq(arg, "--spec-type")) {
             const char * t = need(arg);
-            if (eq(t, "draft-mtp")) {
-                st.spec_mtp = true;
+            if (eq(t, "draft-mtp") || eq(t, "mtp")) {
+                st.spec_algorithm = kvmem::SpeculativeAlgorithm::Mtp;
+            } else if (eq(t, "draft-dflash") || eq(t, "dflash2")) {
+                st.spec_algorithm = kvmem::SpeculativeAlgorithm::DFlash2;
             } else if (eq(t, "none")) {
-                st.spec_mtp = false;
+                st.spec_algorithm = kvmem::SpeculativeAlgorithm::None;
             } else {
-                fprintf(stderr, "unsupported --spec-type %s (P7-0: draft-mtp|none)\n", t);
+                fprintf(stderr, "unsupported --spec-type %s (none|draft-mtp|draft-dflash)\n", t);
                 return 1;
             }
+            st.spec_enabled = st.spec_algorithm != kvmem::SpeculativeAlgorithm::None;
+        } else if (eq(arg, "--spec-draft-model") || eq(arg, "-md")) {
+            st.spec_draft_model = need(arg);
         } else if (eq(arg, "--spec-draft-n-max")) {
             st.spec_n_max = kvmem_cli_int(arg, need(arg));
         } else if (eq(arg, "--spec-draft-p-min")) {
@@ -1201,9 +1207,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR --kvmem-block-tokens must be positive\n");
         return 1;
     }
-    if (st.spec_mtp && st.kparams.enabled && st.kparams.mtp_state == 2 &&
+    if (st.spec_enabled && st.kparams.enabled && st.kparams.mtp_state == 2 &&
             (st.spec_n_max < 1 || st.spec_n_max > 5)) {
-        fprintf(stderr, "KVMEM_STARTUP_ERROR replay MTP requires --spec-draft-n-max in 1..5\n");
+        fprintf(stderr, "KVMEM_STARTUP_ERROR ReplaySSM requires --spec-draft-n-max in 1..5\n");
         return 1;
     }
 
@@ -1224,8 +1230,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // No speculative rollback state is needed without MTP.
-    if (!st.spec_mtp) st.kparams.mtp_state = 0;
+    // No speculative rollback state is needed without drafts.
+    if (!st.spec_enabled) st.kparams.mtp_state = 0;
     if (st.kparams.enabled) {
         if (!nvme_dir.empty()) {
             st.kparams.nvme_dir = nvme_dir.c_str();
@@ -1235,7 +1241,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
-    mparams.load_mtp = st.spec_mtp;
+    mparams.load_mtp = st.spec_algorithm == kvmem::SpeculativeAlgorithm::Mtp;
     mparams.load_mode = options.load_mode;
     try {
         device_config.apply(options, mparams);
@@ -1243,11 +1249,17 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "invalid GPU configuration: %s\n", e.what());
         return 1;
     }
-    if (mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR && st.spec_mtp && st.kparams.enabled && st.kparams.mtp_state != 0) {
+    if (st.spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 &&
+            (st.spec_draft_model.empty() || device_config.devices.size() > 2 ||
+             mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR)) {
+        fprintf(stderr, "KVMEM_STARTUP_ERROR DFlash2 requires --spec-draft-model and one GPU\n");
+        return 1;
+    }
+    if (mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR && st.spec_enabled && st.kparams.enabled && st.kparams.mtp_state != 0) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR tensor KVMem currently supports MTP snapshots only; use --kvmem-mtp-state snapshots\n");
         return 1;
     }
-    if (device_config.devices.size() > 2 && st.spec_mtp && mparams.split_mode != LLAMA_SPLIT_MODE_TENSOR &&
+    if (device_config.devices.size() > 2 && st.spec_enabled && mparams.split_mode != LLAMA_SPLIT_MODE_TENSOR &&
             (!st.kparams.enabled || st.kparams.mtp_state == 1 ||
              (st.kparams.mtp_state == 2 && !config_sources.contains("--kvmem-mtp-state")))) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR multi-GPU MTP requires --kvmem and explicit --kvmem-mtp-state snapshots|replay (auto is not supported yet)\n");
@@ -1277,6 +1289,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR failed to load model: --model file is missing or unreadable: %s\n", model_path.c_str());
         return 1;
     }
+    if (!st.spec_draft_model.empty() && !readable(st.spec_draft_model)) {
+        fprintf(stderr, "KVMEM_STARTUP_ERROR --spec-draft-model file is missing or unreadable\n");
+        return 1;
+    }
     if (!mmproj_path.empty() && !readable(mmproj_path)) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR --mmproj file is missing or unreadable: %s\n", mmproj_path.c_str());
         return 1;
@@ -1296,7 +1312,7 @@ int main(int argc, char ** argv) {
         {"kv", {{"k", ggml_type_name(st.cache_type_k)}, {"v", ggml_type_name(st.cache_type_v)}}},
         {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve},
                    {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}}},
-        {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
+        {"spec_type", kvmem::speculative_name(st.spec_algorithm)},
         {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu},
                     {"device", mmproj_gpu ? (mmproj_device_name.empty() ? "auto" : mmproj_device_name) : "CPU"},
                     {"video_fps", video_fps}}},
@@ -1310,6 +1326,10 @@ int main(int argc, char ** argv) {
     st.model = shared_model.get();
     if (!st.model) {
         fprintf(stderr, "failed to load model\n");
+        return 1;
+    }
+    if (st.spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 && llama_model_n_devices(st.model) > 1) {
+        fprintf(stderr, "KVMEM_STARTUP_ERROR DFlash2 requires a single target GPU; select one device\n");
         return 1;
     }
     st.vocab = llama_model_get_vocab(st.model);
@@ -1331,13 +1351,14 @@ int main(int argc, char ** argv) {
     cparams.n_seq_max = 1;
     cparams.type_k = st.cache_type_k;
     cparams.type_v = st.cache_type_v;
-    if (st.spec_mtp) {
+    if (st.spec_enabled) {
         const uint32_t n_out = (uint32_t) (1 + std::max(0, st.spec_n_max));
         cparams.n_outputs_max = n_out;
         cparams.n_outputs_max_per_seq = n_out;
         cparams.n_rs_seq = (uint32_t) std::max(0, st.spec_n_max);
     }
     std::shared_ptr<kvmem::HostKvStorage> shared_payload_storage;
+    std::shared_ptr<llama_model> shared_draft_model;
     auto initialize_lane = [&](ServerState & st) {
         kvmem_execution_scope scope(st.execution.get());
         llama_kvmem_set_params(&st.kparams);
@@ -1353,8 +1374,10 @@ int main(int argc, char ** argv) {
         kvmem_diag("KVMEM_CONTEXT target threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
                 llama_n_threads(st.ctx), llama_n_threads_batch(st.ctx), llama_n_ubatch(st.ctx),
                 llama_flash_attn_type_name(cparams.flash_attn_type));
-        if (st.spec_mtp) {
+        if (st.spec_enabled) {
             kvmem_spec_opts sopts;
+            sopts.algorithm = st.spec_algorithm;
+            sopts.draft_model = st.spec_draft_model;
             sopts.n_max = st.spec_n_max;
             sopts.p_min = st.spec_p_min;
             sopts.n_gpu_layers = ngl;
@@ -1368,8 +1391,11 @@ int main(int argc, char ** argv) {
             sopts.type_k = st.cache_type_k;
             sopts.type_v = st.cache_type_v;
             sopts.draft_type = st.spec_cache_type;
-            if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts)) {
+            if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts, shared_draft_model)) {
                 return false;
+            }
+            if (st.spec_algorithm == kvmem::SpeculativeAlgorithm::DFlash2 && !shared_draft_model) {
+                shared_draft_model = st.spec.init->shared_model();
             }
         }
 
@@ -1400,7 +1426,9 @@ int main(int argc, char ** argv) {
         next->cache_type_k = st.cache_type_k;
         next->cache_type_v = st.cache_type_v;
         next->spec_cache_type = st.spec_cache_type;
-        next->spec_mtp = st.spec_mtp;
+        next->spec_enabled = st.spec_enabled;
+        next->spec_algorithm = st.spec_algorithm;
+        next->spec_draft_model = st.spec_draft_model;
         next->spec_n_max = st.spec_n_max;
         next->spec_p_min = st.spec_p_min;
         next->enable_thinking_default = st.enable_thinking_default;
@@ -1643,8 +1671,13 @@ int main(int argc, char ** argv) {
     if (st.conv_limits.max_stores > 1) {
         props["kvmem"]["conversations"] = st.conv_limits.max_stores;
     }
-    svr.Get("/props", [props, &lane_conversations](const httplib::Request &, httplib::Response & res) {
+    svr.Get("/props", [props, &lane_conversations, &st, &lanes](const httplib::Request &, httplib::Response & res) {
         auto current = props;
+        kvmem::SpeculativeStatistics total;
+        for (const auto * lane : lanes) total.add(lane->spec.telemetry->snapshot());
+        current["speculative"] = kvmem::speculative_json<json>(st.spec.config,
+            {{kvmem::SpeculativeAlgorithm::Mtp, 5, false, false, 4, 8, "optional_gguf"},
+             {kvmem::SpeculativeAlgorithm::DFlash2, 5, false, false, 4, 1, "required_gguf"}}, total);
         if (lane_conversations) current["kvmem"]["usage"] = lane_conversations->status();
         res.set_header("Cache-Control", "no-store");
         res.set_content(current.dump(), "application/json");
@@ -2680,7 +2713,7 @@ int main(int argc, char ** argv) {
     LOG_INF("srv    llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d think=%d rbudget=%d qmax=%d\n",
             host.c_str(), port, st.model_name.c_str(), (int) st.kparams.enabled,
             st.kparams.method == 1 ? "retrieval" : "recency", n_ctx,
-            st.spec.ok ? "draft-mtp" : "off", st.spec_n_max, (int) st.enable_thinking_default,
+            kvmem::speculative_name(st.spec.config.algorithm), st.spec_n_max, (int) st.enable_thinking_default,
             st.reasoning_budget_default, st.query_max_tokens);
     if (!svr.listen_after_bind()) {
         fprintf(stderr, "listen failed\n");

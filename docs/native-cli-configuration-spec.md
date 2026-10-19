@@ -151,8 +151,9 @@ KVMem 新公共配置的默认策略由一份版本化定义提供，模板可�
 
 | 公共设置 | llama.cpp 原生参数 | NInfer 原生参数 | 规则 |
 |---|---|---|---|
-| 推测解码方式 | `--spec-type none\|draft-mtp` | `--spec mtp\|dflash\|dflash2`；省略关闭 | 公共 UI；按后端输出原生枚举；NInfer KVMem 只开放普通解码/MTP |
-| MTP 草稿数量 | `--spec-draft-n-max` | `--draft-tokens` | 公共 UI；固定数量与自适应上限明确区分，范围按组合校验 |
+| 推测解码方式 | `--spec-type none\|draft-mtp\|draft-dflash` | `--spec mtp\|dflash\|dflash2`；省略关闭 | 公共 UI 通过 `SpeculativeMode` 选择关闭/MTP/DFlash2，按后端映射；普通 DFlash 不在公共入口开放 |
+| 草稿数量 | `--spec-draft-n-max` | `--draft-tokens` | 公共 `DraftTokens`；固定数量与自适应上限明确区分，范围按组合校验 |
+| 草稿模型 | `--spec-draft-model` | 使用模型内置组件 | 公共 `DraftModel`；llama DFlash2 必填匹配的 GGUF，MTP 可选；NInfer 禁止旁挂文件 |
 | 自适应 MTP | 无对应项 | `--adaptive-mtp` | NInfer 可选；依赖 MTP；关闭时保留固定草稿数量 |
 | Ngram 草稿 | 无对应项 | `--ngram-draft-tokens`、`--ngram-min-match` | NInfer 可选；开启 spec 后省略宽度会默认 15，明确关闭须传 0 |
 | MTP KV 格式 | `--spec-kv-dtype` | 跟随主 KV 格式 | llama 可单独配置，NInfer 显示跟随主 KV |
@@ -267,8 +268,9 @@ KVMem 新公共配置的默认策略由一份版本化定义提供，模板可�
 | `--frequency-penalty` | [-2,2]，默认 0 |
 | `--repeat-penalty` / `--repetition-penalty` | 正数，默认 1 |
 | `--seed` / `-s` | uint32；省略使用随机行为；请求字段可覆盖进程默认 |
-| `--spec-type` | none/draft-mtp，默认 none |
-| `--spec-kv-dtype` | MTP KV 格式，默认 f16；接受 f16/f32/q8_0/q5_0/q4_0，仍需组合校验 |
+| `--spec-type` | none/draft-mtp/draft-dflash，默认 none；mtp/dflash2 为对应别名 |
+| `--spec-draft-model` | DFlash2 必填独立草稿 GGUF；MTP 可选旁挂 GGUF；DFlash2 当前最多四路、单 GPU |
+| `--spec-kv-dtype` | 草稿 KV 格式，默认 f16；接受 f16/f32/q8_0/q5_0/q4_0，仍需组合校验 |
 | `--spec-draft-n-max` | 默认 3；当前 KVMem replay 模式要求 1–5 |
 | `--spec-draft-p-min` | [0,1]，默认 0；最小草稿概率 |
 | `--jinja` | 兼容开关；本服务始终启用 Jinja；`--no-jinja` 被明确拒绝 |
@@ -425,7 +427,7 @@ KVMem 新公共配置的默认策略由一份版本化定义提供，模板可�
 
 | 原生参数 | 输入和原生行为 |
 |---|---|
-| `--spec` | mtp/dflash/dflash2；省略关闭；KVMem 只允许 mtp |
+| `--spec` | mtp/dflash/dflash2；省略关闭；KVMem 允许 mtp/dflash2，DFlash2 当前最多四路单卡 |
 | `--draft-tokens` | 启用推测解码时 1–15；省略为 0，不能只写 spec 而漏掉有效草稿数量 |
 | `--lm-head-draft` | 使用优化的 proposal head；有该组件时默认自动采用；依赖推测解码 |
 | `--full-draft-head` | 对草稿使用完整输出头；与优化 proposal head 选择相对，保留原生名称 |
@@ -540,7 +542,9 @@ KVMem 新公共配置的默认策略由一份版本化定义提供，模板可�
 | llama 公共 SSD 与旧层 | 公共 SSD 不可与旧 CPU arena、在线 NVMe、raw-K NVMe 或旧会话磁盘预算混用 | 旧接口只进入兼容迁移说明；新 UI 和新模板只使用公共 H/D；不能把软上限或局部磁盘额度直接改名为全局硬预算 |
 | llama 并发 | 1–4；多 lane 受 GPU、切分、旧磁盘路径等限制；显式 HTTP 线程至少为 2×并发 | 按实际组合校验，不只检查数字范围 |
 | llama MTP | replay 草稿 1–5；tensor+KVMem MTP 只允许 snapshots | 根据所选状态策略和切分限制草稿及状态选项 |
+| llama DFlash2 | 独立匹配 GGUF、最多四路、单 GPU；公共入口固定 1–5，无 adaptive/ngram | 使用上游原生 draft-dflash；各路共享只读草稿权重，上下文/KV/回滚独立。5060 Ti 的 27B IQ3＋Q4 四路验证使用 CPU 卸载与 snapshots，全 GPU 显存不足，详见并发验收记录 |
 | NInfer MTP | 需要 spec=mtp 和 drafts 1–15；adaptive 依赖 MTP；KVMem 拒绝 DFlash 和非零 mtp-attention-window | 分别显示固定数量与自适应上限 |
+| NInfer DFlash2 | 内置草稿组件、固定 1–15、最多四路单卡；可使用原生 ngram，不支持 adaptive | 按模式启用控件，不把 MTP 自适应策略应用到 DFlash2 |
 | NInfer ngram | spec 开启且省略宽度时默认 15；显式 0 关闭；并发>1 时 >15 自动降至15；KVMem 还要求草稿验证空间不超过 R | 预览请求值与有效值；不能把省略等同关闭 |
 | NInfer 快速预填充 | 当前 KVMem 仅允许 int8/rk8v4/rk4v4/rk4v4-e8/rk2v4-e8；具体有效 chunk 可能被调整 | 格式切换时重新校验，展示调整结果 |
 | llama 多卡 | 显式选择至少两张同一 CUDA 后端的设备；不允许重复设备；需要 gpu-layers=all 和 layer/tensor；比例列表逐卡对应；row 被服务拒绝 | 切分方式、GPU 层数和设备列表一起校验；不因解析器识别 row 就展示为可用 |
@@ -652,7 +656,8 @@ UI 继续通过 JSON 参数数组调用内部脚本。直接脚本增加 `Worker
 | LRFU 关闭 | 衰减系数与候选比例变灰；分数组合方式仍可设置；导出明确的关闭开关 |
 | 图像输入关闭 | 图像 token 上限、编码器存放位置变灰并省略 |
 | 默认思考模式关闭 | 默认思考预算变灰并省略；不改写后端原生开关 |
-| MTP 长度为 0 或留空 | 自适应 MTP、N-gram 推测与匹配设置变灰并省略；自适应开关本身不控制固定 MTP/N-gram |
+| 草稿方式关闭 | 长度、策略、草稿模型、N-gram 及匹配设置变灰并省略；保留浏览器草稿以便恢复 |
+| 草稿方式不支持 adaptive/ngram | 对应选项变灰并省略；DFlash2 只使用固定长度 |
 | N-gram 推测为 0 | 最短匹配设置变灰并省略 |
 | KV 格式不支持快速预填充 | 快速预填充变灰并省略，预填充分块仍独立设置 |
 | 少于两张显卡 | NInfer 层数分配不可编辑；显卡数量变化时清除已失效的层数分配 |

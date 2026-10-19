@@ -26,6 +26,10 @@ param(
     [string]$KvType = 'int8',
     [ValidateRange(0, 15)][int]$MtpDrafts = 4,
     [switch]$AdaptiveMtp = $true,
+    [ValidateSet('none', 'mtp', 'dflash2')][string]$SpeculativeMode,
+    [ValidateRange(0, 15)][int]$DraftTokens,
+    [ValidateSet('fixed', 'adaptive')][string]$DraftPolicy,
+    [string]$DraftModel,
     [switch]$FastPrefill,
     [ValidateRange(0, 63)][int]$NgramDrafts = 31,
     [ValidateRange(4, 64)][int]$NgramMinMatch = 12,
@@ -69,5 +73,12 @@ if (!$MtpDrafts) {
     if (!$PSBoundParameters.ContainsKey('AdaptiveMtp')) { $forward['AdaptiveMtp'] = $false }
     if (!$PSBoundParameters.ContainsKey('NgramDrafts')) { $forward['NgramDrafts'] = 0 }
 }
+if ($PSBoundParameters.ContainsKey('SpeculativeMode')) {
+    foreach ($legacy in @('MtpDrafts','AdaptiveMtp','NgramDrafts')) {
+        if (!$PSBoundParameters.ContainsKey($legacy)) { $null = $forward.Remove($legacy) }
+    }
+}
+if ($PSBoundParameters.ContainsKey('DraftTokens') -and !$PSBoundParameters.ContainsKey('MtpDrafts')) { $null = $forward.Remove('MtpDrafts') }
+if ($PSBoundParameters.ContainsKey('DraftPolicy') -and !$PSBoundParameters.ContainsKey('AdaptiveMtp')) { $null = $forward.Remove('AdaptiveMtp') }
 if (!$forward.ContainsKey('Model')) { $forward['Model'] = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../model.ninfer')) }
 & (Join-Path $PSScriptRoot 'start-backend.ps1') @forward

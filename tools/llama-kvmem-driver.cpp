@@ -1902,7 +1902,7 @@ bool llama_driver_prepare(LlamaEngineState & st, const std::vector<llama_token> 
                         llama_memory_seq_pos_min(mem, 0), llama_memory_seq_pos_max(mem, 0),
                         llama_memory_seq_pos_max(mem, 0) + 1);
             }
-            if (st.spec.ctx_dft && !past_query) {
+            if (st.spec.ctx_dft && !st.spec.independent_draft() && !past_query) {
                 llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
                 if (md) {
                     llama_memory_seq_rm(md, 0, q0, q1);
@@ -1916,7 +1916,7 @@ bool llama_driver_prepare(LlamaEngineState & st, const std::vector<llama_token> 
             llama_synchronize(ctx);
             kvmem_diag("KVMEM_TRACE query_replay begin=%d n=%d recr_ckpt=%d\n",
                     q0, q1 - q0, (int) recr_ckpt);
-            if (st.spec.ctx_dft && !past_query) {
+            if (st.spec.ctx_dft && !st.spec.independent_draft() && !past_query) {
                 // First pass of this query: seq_rm left a hole in the draft cache.
                 // M-RoPE cannot fill it while a suffix remains, so drop [q0, inf)
                 // and append in order up to q1. Continuation keeps draft suffix.

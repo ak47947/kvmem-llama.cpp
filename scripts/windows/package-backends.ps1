@@ -89,6 +89,7 @@ foreach ($entry in @(@('llamacpp', $LlamaWorker, 'llama-kvmem-server.exe'),
 foreach ($script in 'start-backend.ps1', 'start-ninfer.ps1', 'start-dflash2.ps1', 'native-process.ps1') {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $script) -Destination (Join-Path $OutputDir 'scripts/windows')
 }
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../speculative-capabilities.json') -Destination (Join-Path $OutputDir 'scripts/speculative-capabilities.json')
 Copy-Item -LiteralPath (Join-Path $source 'docs') -Destination (Join-Path $OutputDir 'docs') -Recurse
 $packageReadme = @'
 # KVMem Windows workers

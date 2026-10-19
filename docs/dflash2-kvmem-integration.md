@@ -1,5 +1,7 @@
 # DFlash2 KVMem context integration
 
+The common launcher and console now also expose llama.cpp DFlash2 through its pinned upstream native implementation. Configuration, capabilities and `/props` statistics are shared; inference execution remains backend-owned. See the [interface contract](speculative-interface.md) and [focused RTX 5060 Ti validation](speculative-validation-20261019.md). The NInfer performance results below retain their original backend and workload scope.
+
 This integrates the DFlash2 context fixes from
 [melis2023/ninfer-kvmem-actkv](https://github.com/melis2023/ninfer-kvmem-actkv/commit/68fa0e0d67f8d4caafe90bc68bf79042c6b62271)
 into the pinned NInfer backend. The implementation is adapted from the contributor's exported

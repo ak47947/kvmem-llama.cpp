@@ -293,6 +293,12 @@ if (KVMEM_BUILD_LLAMA)
     target_link_libraries(llama-kvmem-cli PRIVATE llama llama-common kvmem)
     target_compile_features(llama-kvmem-cli PRIVATE cxx_std_17)
 
+    add_executable(kvmem-speculative-shared-model-test tests/speculative-shared-model-test.cpp)
+    target_link_libraries(kvmem-speculative-shared-model-test PRIVATE llama llama-common)
+    target_compile_features(kvmem-speculative-shared-model-test PRIVATE cxx_std_17)
+    add_test(NAME kvmem-speculative-shared-model-test COMMAND kvmem-speculative-shared-model-test)
+    set_tests_properties(kvmem-speculative-shared-model-test PROPERTIES SKIP_RETURN_CODE 77)
+
     option(KVMEM_BUILD_PERF_TOOLS "Build manual fixed-token backend comparison driver" OFF)
     if (KVMEM_BUILD_PERF_TOOLS)
         add_executable(kvmem-llama-backend-perf tests/llama-backend-perf.cpp)

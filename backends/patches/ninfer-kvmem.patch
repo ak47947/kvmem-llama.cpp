@@ -9707,7 +9707,7 @@ index c056b1f50025966fc6f804d680d2977ff73ae57a..5332603b7fa60096b0081b9fdebc008a
 +
  } // namespace ninfer::runtime
 diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
-index d738cd25d51654a844224538418f7cf255c26d45..a50d7a3cfacd43fe43235dd51af49f8586471c0c 100644
+index d738cd25d51654a844224538418f7cf255c26d45..e37625ccdf24f78af1645f73a671ec55d4aa70f9 100644
 --- a/src/runtime/engine/model_instance.cpp
 +++ b/src/runtime/engine/model_instance.cpp
 @@ -1,4 +1,5 @@
@@ -9787,7 +9787,7 @@ index d738cd25d51654a844224538418f7cf255c26d45..a50d7a3cfacd43fe43235dd51af49f85
      if (options.artifact_path.empty()) {
          throw std::invalid_argument("Engine artifact_path must not be empty");
      }
-@@ -236,6 +285,104 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
+@@ -236,6 +285,103 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
  } // namespace
  
  EngineOptions normalize_engine_options(EngineOptions options) {
@@ -9842,10 +9842,9 @@ index d738cd25d51654a844224538418f7cf255c26d45..a50d7a3cfacd43fe43235dd51af49f85
 +        const bool fixed_mtp = memory_mtp && options.speculative.mtp_policy == MtpDraftPolicy::Fixed;
 +        const bool adaptive_mtp = memory_mtp &&
 +            options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
-+        // DFlash2 uses the KVMem checkpoint/ring path. Keep its initial qualification
-+        // on one sequence and one GPU; ordinary and MTP retain their wider contract.
++        // DFlash2 KVMem is qualified for up to four lanes on one GPU.
 +        const bool memory_dflash2 = options.speculative.backend == SpeculativeBackend::DFlash2 &&
-+            options.max_concurrency == 1 && options.devices.size() <= 1 &&
++            options.max_concurrency <= 4 && options.devices.size() <= 1 &&
 +            options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
 +        const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
 +            ((memory_mtp || memory_dflash2) && (options.max_concurrency == 1 || options.speculative.ngram_draft_tokens <= 15) &&
@@ -9885,14 +9884,14 @@ index d738cd25d51654a844224538418f7cf255c26d45..a50d7a3cfacd43fe43235dd51af49f85
 +             options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
 +             options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
 +            throw std::invalid_argument("KVMem requires explicit B+R page-aligned "
-+                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-sequence/single-GPU DFlash2 1..15, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
++                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-GPU DFlash2 1..15 with 1..4 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
 +                "and disabled prefix cache");
 +        }
 +    }
      switch (options.purpose) {
      case EnginePurpose::Generation:
          break;
-@@ -259,6 +406,22 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+@@ -259,6 +405,22 @@ EngineOptions normalize_engine_options(EngineOptions options) {
          throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
      }
      ContextCacheOptions& cache = options.context_cache;
@@ -9915,7 +9914,7 @@ index d738cd25d51654a844224538418f7cf255c26d45..a50d7a3cfacd43fe43235dd51af49f85
      if (options.speculative.ngram_archive_bytes != 0 &&
          options.speculative.ngram_draft_tokens == 0) {
          throw std::invalid_argument(
-@@ -270,10 +433,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
+@@ -270,10 +432,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
          throw std::invalid_argument("ngram session capacity must be between 1 MiB and the total "
                                      "archive capacity");
      }
@@ -9929,7 +9928,7 @@ index d738cd25d51654a844224538418f7cf255c26d45..a50d7a3cfacd43fe43235dd51af49f85
      }
      const std::uint32_t concurrency = options.max_concurrency;
      // Injected grafts stay resident for the life of the Engine, each in a StateImage and a
-@@ -623,6 +785,30 @@ ResidencyTransition ModelInstance::resume(DeviceContext& device, DeviceSnapshot&
+@@ -623,6 +784,30 @@ ResidencyTransition ModelInstance::resume(DeviceContext& device, DeviceSnapshot&
  ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& device) {
      validate_options(requested);
      install_device_route_profile_for(requested, device);
@@ -9960,7 +9959,7 @@ index d738cd25d51654a844224538418f7cf255c26d45..a50d7a3cfacd43fe43235dd51af49f85
      const auto start = Clock::now();
      // Every later stage of startup checks its options against the ones the model was loaded with, so
      // the stage split is decided once, here, and carried in the options from then on.
-@@ -680,8 +866,15 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext&
+@@ -680,8 +865,15 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext&
              options.context_cache.host_kv_capacity_bytes = 0;
          }
      }
@@ -9976,7 +9975,7 @@ index d738cd25d51654a844224538418f7cf255c26d45..a50d7a3cfacd43fe43235dd51af49f85
      frontend.complete();
      StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
      const std::size_t overlay_window_bytes =
-@@ -701,15 +894,39 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext&
+@@ -701,15 +893,39 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext&
              graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
          }
      }
@@ -10022,7 +10021,7 @@ index d738cd25d51654a844224538418f7cf255c26d45..a50d7a3cfacd43fe43235dd51af49f85
      std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
      if (!instance->model->expert_sources().layers.empty()) {
          // Price startup with the real allocations before the KV plan is finalized: the delivery
-@@ -721,75 +938,139 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext&
+@@ -721,75 +937,139 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext&
          const bool automatic_kv = options.kv_capacity.mode == KvCapacityMode::Automatic;
          const std::uint64_t headroom =
              automatic_kv ? options.kv_capacity.automatic_headroom_bytes : 0;
@@ -10390,14 +10389,14 @@ index 0000000000000000000000000000000000000000..f3f0ba12ef0d63081f442aac893ecb90
 +
 +} // namespace ninfer::runtime
 diff --git a/src/serve/CMakeLists.txt b/src/serve/CMakeLists.txt
-index 609c2aac1ed78eefa7d10e6289443da798aed551..30543736986358833f2da50245d11597cbb0c8ca 100644
+index 609c2aac1ed78eefa7d10e6289443da798aed551..f83baf6994025375bc55c67330bab24792c79c43 100644
 --- a/src/serve/CMakeLists.txt
 +++ b/src/serve/CMakeLists.txt
 @@ -34,6 +34,7 @@ add_library(ninfer_serve STATIC
    model_registry.cpp
  )
  ninfer_internal_includes(ninfer_serve)
-+target_link_libraries(ninfer_serve PRIVATE kvmem ${CMAKE_DL_LIBS})
++target_link_libraries(ninfer_serve PUBLIC kvmem PRIVATE ${CMAKE_DL_LIBS})
  target_link_libraries(ninfer_serve
    PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
    PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_product_prompt_input
@@ -10611,7 +10610,7 @@ index b2544e2537f973e5ed8fb8e899659fa141fd7f99..64336c8c3966c471dde1e234505bc343
      ninfer::ResolvedSamplingParameters sampling;
      double prepare_seconds     = 0.0;
 diff --git a/src/serve/http_server.cpp b/src/serve/http_server.cpp
-index b539c18e2e679ec305f53677297a68f20b426092..f9935408e87737075ec27eeb9b600bd839d624d8 100644
+index b539c18e2e679ec305f53677297a68f20b426092..cd586fb25ef3be262452fcfbd8e4b32d38bb663b 100644
 --- a/src/serve/http_server.cpp
 +++ b/src/serve/http_server.cpp
 @@ -1,9 +1,13 @@
@@ -10747,11 +10746,21 @@ index b539c18e2e679ec305f53677297a68f20b426092..f9935408e87737075ec27eeb9b600bd8
          {"default_generation_settings",
           {{"n_ctx", facts.capacity.max_context},
            {"speculative", options.speculative.backend != ninfer::SpeculativeBackend::None},
-@@ -1055,6 +1088,36 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
+@@ -1055,6 +1088,46 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
          // The WebUI ungreys its "Use llama-server proxy" option from this flag alone.
          {"cors_proxy_enabled", options_.webui_mcp_proxy},
      };
 +    props["backend"] = "ninfer";
++    kvmem::SpeculativeConfig spec;
++    if (options.speculative.backend == SpeculativeBackend::Mtp) spec.algorithm = kvmem::SpeculativeAlgorithm::Mtp;
++    if (options.speculative.backend == SpeculativeBackend::DFlash) spec.algorithm = kvmem::SpeculativeAlgorithm::DFlash;
++    if (options.speculative.backend == SpeculativeBackend::DFlash2) spec.algorithm = kvmem::SpeculativeAlgorithm::DFlash2;
++    spec.draft_tokens = options.speculative.draft_tokens;
++    spec.adaptive = options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
++    spec.ngram_draft_tokens = options.speculative.ngram_draft_tokens;
++    props["speculative"] = kvmem::speculative_json<nlohmann::json>(spec,
++        {{kvmem::SpeculativeAlgorithm::Mtp, 15, true, true, 8, 8, "embedded"},
++         {kvmem::SpeculativeAlgorithm::DFlash2, 15, false, true, 4, 1, "embedded"}}, metrics_.speculative_statistics());
 +    const auto& execution = service.engine_options();
 +    props["execution"] = {{"mode", execution.devices.size() > 1 ? "layer" : "single"},
 +        {"devices", execution.devices.empty() ? std::vector<int>{execution.device} : execution.devices},
@@ -10770,7 +10779,7 @@ index b539c18e2e679ec305f53677297a68f20b426092..f9935408e87737075ec27eeb9b600bd8
 +            {"active_kv_tiering", true},
 +            {"ssd_enabled", options.kvmem.disk_bytes != 0},
 +            {"ssd_persistence", "process"},
-+            {"speculative_decoding", options.speculative.backend == SpeculativeBackend::Mtp},
++            {"speculative_decoding", options.speculative.backend != SpeculativeBackend::None},
 +            {"mtp_drafts", options.speculative.draft_tokens}, {"multimodal", options.enable_vision},
 +            {"ngram_drafts", options.speculative.ngram_draft_tokens},
 +            {"ngram_min_match", options.speculative.ngram_min_match},
@@ -10784,7 +10793,7 @@ index b539c18e2e679ec305f53677297a68f20b426092..f9935408e87737075ec27eeb9b600bd8
      res.set_content(props.dump(), "application/json");
  }
  
-@@ -1349,6 +1412,26 @@ HttpServer::ModelFacts HttpServer::model_facts(const ModelRegistry::Lease& lease
+@@ -1349,6 +1422,26 @@ HttpServer::ModelFacts HttpServer::model_facts(const ModelRegistry::Lease& lease
      }
      // memory_summary() takes the Engine execution lock: computed once per Engine instance.
      ModelFacts facts;
@@ -11519,8 +11528,54 @@ index 0cfbd04a077f2cd961f411b36c4bdebb76a09b5a..fddf5ac0198aac0c92cfbca1f71f42fe
  [[nodiscard]] bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept;
  
  // An optional `post_thinking` object: temperature (up to `max_temperature`), top_p, top_k, min_p,
+diff --git a/src/serve/serve_metrics.cpp b/src/serve/serve_metrics.cpp
+index bae357d43fe4702e25661fb4245145b3267e5987..d3c9b331c85ced35b30f845db9efdfcb70d4116c 100644
+--- a/src/serve/serve_metrics.cpp
++++ b/src/serve/serve_metrics.cpp
+@@ -119,6 +119,15 @@ void ServeMetrics::record_done(const GenerationOutcome& outcome) {
+     prefix_cache_hit_tokens_total_ += metrics.prefix_cache_hit_tokens;
+     draft_tokens_total_ += metrics.speculative_draft_tokens;
+     draft_accepted_tokens_total_ += metrics.speculative_accepted_tokens;
++    if (metrics.speculative_backend != SpeculativeBackend::None) {
++        kvmem::SpeculativeStatistics stats;
++        stats.requests = 1; stats.rounds = metrics.speculative_rounds;
++        stats.drafted_tokens = metrics.speculative_draft_tokens;
++        stats.accepted_tokens = metrics.speculative_accepted_tokens;
++        stats.generated_tokens = outcome.tokens.size();
++        stats.fallback_steps = metrics.speculative_fallback_steps;
++        speculative_statistics_.add(stats);
++    }
+ }
+ 
+ void ServeMetrics::record_failure() {
+diff --git a/src/serve/serve_metrics.h b/src/serve/serve_metrics.h
+index e8245d645c1419441c2397bd7381edf216c75a57..ddf618d92b29234a35f6bf5a05456dcb722e0701 100644
+--- a/src/serve/serve_metrics.h
++++ b/src/serve/serve_metrics.h
+@@ -9,6 +9,7 @@
+ 
+ #include "serve/generation_service.h"
+ #include "serve/load_report.h"
++#include "kvmem/speculative.hpp"
+ 
+ #include <cstdint>
+ #include <mutex>
+@@ -28,9 +29,13 @@ public:
+     void record_rejection();
+ 
+     [[nodiscard]] std::string render(const LoadCapacity& capacity, const LoadSample& sample) const;
++    [[nodiscard]] kvmem::SpeculativeStatistics speculative_statistics() const {
++        const std::lock_guard lock(mutex_); return speculative_statistics_;
++    }
+ 
+ private:
+     mutable std::mutex mutex_;
++    kvmem::SpeculativeStatistics speculative_statistics_;
+     std::uint64_t requests_total_                = 0;
+     std::uint64_t requests_failed_total_         = 0;
+     std::uint64_t requests_rejected_total_       = 0;
 diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
-index 8fc5043c46b464507bb1bd5cc898936dbab34510..d59ed6a29406c087d8db414f5fbef54acf31cf65 100644
+index 8fc5043c46b464507bb1bd5cc898936dbab34510..6b0bc5c9379e5eb3b5bdf3e5750e4ab5abc46974 100644
 --- a/src/serve/serve_options.cpp
 +++ b/src/serve/serve_options.cpp
 @@ -1,6 +1,9 @@
@@ -11788,7 +11843,7 @@ index 8fc5043c46b464507bb1bd5cc898936dbab34510..d59ed6a29406c087d8db414f5fbef54a
      }
      if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
          throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");
-@@ -1712,6 +1820,89 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -1712,6 +1820,88 @@ ServeOptions parse_serve_options(int argc, char** argv) {
      if (options.sleep_idle_seconds != 0 && !options.suspend.enabled && !options.router()) {
          throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
      }
@@ -11805,10 +11860,9 @@ index 8fc5043c46b464507bb1bd5cc898936dbab34510..d59ed6a29406c087d8db414f5fbef54a
 +        const bool fixed_mtp = memory_mtp && options.speculative.mtp_policy == MtpDraftPolicy::Fixed;
 +        const bool adaptive_mtp = memory_mtp &&
 +            options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
-+        // DFlash2 uses the KVMem checkpoint/ring path. Keep its initial qualification
-+        // on one sequence and one GPU; ordinary and MTP retain their wider contract.
++        // DFlash2 KVMem is qualified for up to four lanes on one GPU.
 +        const bool memory_dflash2 = options.speculative.backend == SpeculativeBackend::DFlash2 &&
-+            options.max_concurrency == 1 && options.devices.size() <= 1 &&
++            options.max_concurrency <= 4 && options.devices.size() <= 1 &&
 +            options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
 +        const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
 +            ((memory_mtp || memory_dflash2) && (options.max_concurrency == 1 || options.speculative.ngram_draft_tokens <= 15) &&
@@ -11839,7 +11893,7 @@ index 8fc5043c46b464507bb1bd5cc898936dbab34510..d59ed6a29406c087d8db414f5fbef54a
 +             options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value &&
 +             options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
 +             options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
-+            throw std::invalid_argument("KVMem requires ordinary/fixed/adaptive MTP1..15 or single-sequence/single-GPU DFlash2 1..15, ngram1..63 (automatically capped at 15 with 2..8 lanes), single-GPU or layer-pipeline BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 generation, 1..8 text or resident/CPU-vision lanes, INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
++            throw std::invalid_argument("KVMem requires ordinary/fixed/adaptive MTP1..15 or single-GPU DFlash2 1..15 with 1..4 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), single-GPU or layer-pipeline BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 generation, 1..8 text or resident/CPU-vision lanes, INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
 +                "and exclusive ownership of history caching");
 +        }
 +        if (options.kvmem.recent_blocks() == 0) {
@@ -18812,7 +18866,7 @@ index 982f4ec8969c36b08bac58727d230fe7f2ac1c18..7444638be6959fd867f6039233c34c28
      run_test("admission waits for Program boundary", test_admission_waits_for_program_boundary);
      run_test("session publication order", test_session_publication_order_controls_tied_source);
 diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
-index a257ca089f1634b494dc9229d33335aa3ac01f39..574463bccad9eecce994b64d3bc38d5763142444 100644
+index a257ca089f1634b494dc9229d33335aa3ac01f39..2c9e2fc18d8bc67f51d2995880900f7f4ebdd836 100644
 --- a/tests/test_serve_options.cpp
 +++ b/tests/test_serve_options.cpp
 @@ -2,9 +2,12 @@
@@ -18848,7 +18902,7 @@ index a257ca089f1634b494dc9229d33335aa3ac01f39..574463bccad9eecce994b64d3bc38d57
      int failures = 0;
      failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.draft_min_p == 0,
                        "draft confidence must be opt-in");
-@@ -62,6 +70,529 @@ int main() {
+@@ -62,6 +70,533 @@ int main() {
                                   "--expert-dma-share", share}).hybrid_experts.dma_share == std::stof(share),
                            "server did not preserve an explicit hybrid DMA share");
      }
@@ -19048,20 +19102,24 @@ index a257ca089f1634b494dc9229d33335aa3ac01f39..574463bccad9eecce994b64d3bc38d57
 +            parsed.speculative.mtp_policy == ninfer::MtpDraftPolicy::Fixed,
 +            "KVMem fixed MTP draft count was not preserved");
 +    }
-+    for (const auto drafts : {1U, 3U, 15U}) {
-+        for (const auto copies : {0U, 31U}) {
-+            auto args = memory_args;
-+            args.insert(args.end(), {"--spec", "dflash2", "--draft-tokens", std::to_string(drafts),
-+                                     "--ngram-draft-tokens", std::to_string(copies), "--vision"});
-+            const auto parsed = make_engine_options(parse(args));
-+            failures += check(parsed.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
-+                parsed.speculative.draft_tokens == drafts && parsed.speculative.ngram_draft_tokens == copies &&
-+                parsed.kvmem.device_tokens() == 512 && parsed.enable_vision,
-+                "KVMem DFlash2 lost its draft, vision, or memory configuration");
++    for (const auto lanes : {1U, 2U, 4U}) {
++        for (const auto drafts : {1U, 3U, 15U}) {
++            for (const auto copies : {0U, 31U}) {
++                auto args = memory_args;
++                args.insert(args.end(), {"--spec", "dflash2", "--draft-tokens", std::to_string(drafts),
++                                         "--ngram-draft-tokens", std::to_string(copies), "--vision",
++                                         "--max-concurrency", std::to_string(lanes)});
++                const auto parsed = make_engine_options(parse(args));
++                failures += check(parsed.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
++                    parsed.speculative.draft_tokens == drafts &&
++                    parsed.speculative.ngram_draft_tokens == (lanes > 1 && copies > 15 ? 15 : copies) &&
++                    parsed.kvmem.device_tokens() == 512 && parsed.kv_capacity.explicit_tokens == lanes * 512 && parsed.enable_vision,
++                    "KVMem DFlash2 lost its draft, vision, or memory configuration");
++            }
 +        }
 +    }
 +    for (const auto& extra : std::vector<std::vector<std::string>>{
-+             {"--max-concurrency", "2"}, {"--devices", "0,1"},
++             {"--max-concurrency", "5"}, {"--devices", "0,1"},
 +             {"--draft-tokens", "0"}, {"--draft-tokens", "16"}}) {
 +        auto args = memory_args;
 +        args.insert(args.end(), {"--spec", "dflash2", "--draft-tokens", "3", "--ngram-draft-tokens", "0"});
@@ -19378,7 +19436,7 @@ index a257ca089f1634b494dc9229d33335aa3ac01f39..574463bccad9eecce994b64d3bc38d57
      const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                  "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                  "--ngram-session-mib", "128", "--ngram-native-sessions"});
-@@ -98,7 +629,6 @@ int main() {
+@@ -98,7 +633,6 @@ int main() {
      for (const auto& tail : std::vector<std::vector<std::string>>{
               {"--ngram-draft-tokens", "64"},
               {"--ngram-min-match", "3"},
@@ -19386,7 +19444,7 @@ index a257ca089f1634b494dc9229d33335aa3ac01f39..574463bccad9eecce994b64d3bc38d57
               {"--spec", "none"}}) {
          std::vector<std::string> arguments{"ninfer-serve",
                                             "model.ninfer",
-@@ -134,15 +664,11 @@ int main() {
+@@ -134,15 +668,11 @@ int main() {
      }
      failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.ngram_draft_tokens == 0,
                        "ngram default needs a neural backend");
@@ -19407,7 +19465,7 @@ index a257ca089f1634b494dc9229d33335aa3ac01f39..574463bccad9eecce994b64d3bc38d57
  
      const auto mtp_ngram = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                    "3", "--ngram-draft-tokens", "15"});
-@@ -181,14 +707,12 @@ int main() {
+@@ -181,14 +711,12 @@ int main() {
              } catch (const std::invalid_argument&) { rejected = true; }
              failures += check(rejected, "unsupported neural/ngram pair admitted");
          }
@@ -19428,7 +19486,7 @@ index a257ca089f1634b494dc9229d33335aa3ac01f39..574463bccad9eecce994b64d3bc38d57
          const auto wide_single =
              parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
                     "--ngram-draft-tokens", "63", "--max-concurrency", "1"});
-@@ -1647,3 +2171,11 @@ int main() {
+@@ -1647,3 +2175,11 @@ int main() {
  
      return failures == 0 ? 0 : 1;
  }

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static void require(bool ok, const char * message) {
@@ -49,6 +50,11 @@ static void check(llama_model * model, int rows) {
     llama_synchronize(ctx.get());
     auto selection = llama_kvmem_preview_retrieval();
     require(selection.blocks.size() == 4, "fixture must have four blocks before rewind");
+    selection.blocks = {0, 2};
+    llama_kvmem_apply_selection(selection);
+    require(llama_kvmem_get_attention_view().valid && llama_kvmem_get_attention_view().blocks.size() == 2,
+            "sparse resident layout was not published");
+    selection = llama_kvmem_preview_retrieval();
     selection.blocks = {0};
     llama_kvmem_apply_selection(selection);
     require(llama_kvmem_get_attention_view().blocks.size() == 1, "partial tail was not evicted");
@@ -74,12 +80,12 @@ static void check(llama_model * model, int rows) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 2) return argc == 1 ? 77 : 1;
+    if (argc != 2 && argc != 3) return argc == 1 ? 77 : 1;
     try {
         llama_backend_init();
         ggml_backend_load_all();
         auto params = llama_model_default_params();
-        params.n_gpu_layers = 99;
+        params.n_gpu_layers = argc == 3 ? std::stoi(argv[2]) : 99;
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(argv[1], params), llama_model_free);
         require(bool(model), "model loading failed");
         check(model.get(), 65);
